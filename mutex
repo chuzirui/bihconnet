@@ -1,0 +1,160 @@
+#!/usr/bin/env python
+
+import struct
+import sys
+import time
+import subprocess
+
+def usage():
+    print 'mutex [runtime | tries | fight | win | maxwin] [lines] [time]'
+    print 'runtime: per process time taken in one while loop of the process\n'
+    print 'tries: number of times mutex was attempted to be taken by trylock'
+    print 'fight: number of times mutex was found locked by trylock'
+    print 'win: average time in usecs that mutex has been locked so far'
+    print 'maxwin: max time in uses that the mutex was locked in the last 5 secs\n'
+    print 'rdtsc: print the raw rdtsc value, optional, default is print usecs\n'
+    print 'lines: number of lines of result to show, optional, defaults to 20\n'
+    print 'time: frequency at which to show the results, optional, defaults to 1 sec\n'
+
+def get_max_width(table, index):
+    return max([len(row[index]) for row in table])
+
+def pretty_print_table(table):
+    col_paddings = []
+
+    for i in range(len(table[0])):
+        col_paddings.append(get_max_width(table, i))
+
+    for row in table:
+        print row[0].ljust(col_paddings[0] + 1),
+        for i in range(1, len(row)):
+            col = row[i].rjust(col_paddings[i] + 2)
+            print col,
+        print "\n",
+
+def getRuntime(item):
+    return item[1]
+
+def getTries(item):
+    return item[1]
+
+def getFight(item):
+    return item[2]
+
+def getWin(item):
+    return item[3]
+
+def getMaxWin(item):
+    return item[4]
+
+def parse_proc_stats():
+    structsize = struct.calcsize('<16sQQ')
+    mstats = []
+    f = None
+    try:
+        f = open("/tmp/process_stats")
+    except:
+        if not f:
+            print 'Looks like mutex stats is not turned on, set per_mutex to 1 in /opt/vc/etc/mutexmon.json'
+	    sys.exit(1)
+    data = f.read()
+    nitems = len(data)/structsize
+    start = 0
+    end = structsize
+    for i in range(0, nitems):
+        name,runtime,waittime=struct.unpack("<16sQQ", data[start:end])
+        start = end
+        end = start + structsize
+        mname = name.split('\x00')[0]
+        if mname:
+            mstats.append([mname, runtime, waittime])
+    f.close()
+
+    return mstats
+
+def parse_stats():
+    structsize = struct.calcsize('<16sQQQQ')
+    mstats = []
+    f = None
+    try:
+        f = open("/tmp/mutex_stats")
+    except:
+        if not f:
+            print 'Looks like mutex stats is not turned on, set per_mutex to 1 in /opt/vc/etc/mutexmon.json'
+            sys.exit(1)
+    data = f.read()
+    nitems = len(data)/structsize
+    start = 0
+    end = structsize
+    for i in range(0, nitems):
+        name,tries,fight,win,maxwin=struct.unpack("<16sQQQQ", data[start:end])
+        start = end 
+        end = start + structsize 
+        mname = name.split('\x00')[0]
+        if mname:
+            mstats.append([mname, tries, fight, win, maxwin])
+    f.close()
+
+    return mstats
+
+def print_stats_once():
+    mutex_stats = True
+    if sys.argv[1] == 'tries':
+        all_stats = parse_stats()
+        sorted_stats = sorted(all_stats, key=getTries, reverse=True)
+    if sys.argv[1] == 'fight':
+        all_stats = parse_stats()
+        sorted_stats = sorted(all_stats, key=getFight, reverse=True)
+    if sys.argv[1] == 'win':
+        all_stats = parse_stats()
+        sorted_stats = sorted(all_stats, key=getWin, reverse=True)
+    if sys.argv[1] == 'maxwin':
+        all_stats = parse_stats()
+        sorted_stats = sorted(all_stats, key=getMaxWin, reverse=True)
+    if sys.argv[1] == 'runtime':
+        mutex_stats = False
+        all_stats = parse_proc_stats()
+        sorted_stats = sorted(all_stats, key=getRuntime, reverse=True)
+
+    showlines = 20
+    if len(sys.argv) > 2:
+        showlines = int(sys.argv[2])
+
+    if len(sorted_stats) < showlines:
+        showlines = len(sorted_stats)
+
+    output = []
+    if mutex_stats:
+        output.append(['name', 'tries', 'fight', 'win', 'maxwin'])
+        for i in range(0, showlines):
+            name = str(sorted_stats[i][0])
+            tries = str(sorted_stats[i][1])
+            fight = str(sorted_stats[i][2])
+            win = str(int(sorted_stats[i][3]))
+            maxwin = str(int(sorted_stats[i][4]))
+            output.append([name, tries, fight, win, maxwin])
+    else:
+        output.append(['name', 'runtime', 'mutexwaittime'])
+        for i in range(0, showlines):
+            name = str(sorted_stats[i][0])
+            runtime = str(int(sorted_stats[i][1]))
+            waittime = str(int(sorted_stats[i][1]))
+            output.append([name, runtime, waittime])
+
+    pretty_print_table(output)  
+    print '\n'
+
+if len(sys.argv) < 2:
+    print usage();
+    sys.exit(0)
+if not sys.argv[1] in ['tries', 'fight', 'win', 'maxwin', 'runtime']:
+    print usage();
+    sys.exit(0)
+
+while True:
+    sleeptime = 1
+    if len(sys.argv) > 3:
+        sleeptime = int(sys.argv[3])
+    print_stats_once()
+    time.sleep(sleeptime)
+

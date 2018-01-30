@@ -1,0 +1,42 @@
+#!/bin/bash
+
+set -e
+
+VCG_PACKAGE=/var/lib/velocloud/software_update/vcg_update.tar
+
+# Redirect stdout ( > ) into a named pipe ( >() ) running "tee"
+exec > >(tee -ia /root/software_update.log)
+exec 2>&1
+
+echo =========== VCG upgrade: `date`
+
+if [ ! -e "$VCG_PACKAGE" ] ; then
+        echo "$VCG_PACKAGE is not found."
+        exit 1
+fi
+
+trap "rm -rf /opt/vcrepo.stage" ERR EXIT INT QUIT TERM
+
+rm -rf /opt/vcrepo.stage && mkdir -p /opt/vcrepo.stage
+tar -xf $VCG_PACKAGE -C /opt/vcrepo.stage
+if [ ! -d /opt/vcrepo.stage/vcrepo ]; then
+        echo "$VCG_PACKAGE is missing vcrepo. Corrupted package?"
+        exit 1
+fi
+rm -rf /opt/vcrepo
+mv /opt/vcrepo.stage/vcrepo  /opt/
+
+# run pre-install script if present
+[ -x /opt/vcrepo.stage/scripts/_preinstall.sh ] && /opt/vcrepo.stage/scripts/_preinstall.sh
+
+export DEBIAN_FRONTEND=noninteractive
+debconf-set-selections << EOF
+quagga quagga/really_stop boolean true
+EOF
+aptitude update -y
+aptitude -o Aptitude::Cmdline::ignore-trust-violations=true -y safe-upgrade
+
+# run post-install script if present
+[ -x /opt/vcrepo.stage/scripts/_postinstall.sh ] && /opt/vcrepo.stage/scripts/_postinstall.sh
+
+rm -f $VCG_PACKAGE

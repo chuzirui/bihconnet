@@ -1,0 +1,266 @@
+#!/usr/bin/python
+
+# Usage: genevent.py [args]
+
+'''
+This is a class that allows MGD and other python processes to send events to the VCO
+'''
+
+import sys
+import os
+sys.path.insert(0, '/opt/vc/lib/python')
+# Source tree:
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../pylibs'))
+
+import mgd.options
+import mgd.mgdutils
+import pyutil.events
+import pyutil.utils
+from pyutil.rpc import RPCError, CommunicationError
+
+import argparse
+import json
+import signal
+import errno
+import time
+
+class MgdClient(object):
+    '''
+    Represents one notification target for system events. Hardcoded to event deestination
+    for now.
+    '''
+    def __init__(self, logger=None, endpoint='tcp://127.0.0.1:5002'):
+        if not logger:
+            # Make this interface easier to use for casual tooling
+            import mgd.logconfig
+            logger = mgd.logconfig.getLogger() # default
+        self.logger = logger
+        self.client = mgd.mgdutils.make_local_rpc_client(logger, endpoint).get_proxy()
+        
+    def reset_configuration(self, invoker):
+        '''
+        Tell mgd to deactivate active edged (and standby edged if present)
+        '''
+        try:
+            self.logger.trace("Reset configuration")
+            reply = self.client.resetConfiguration(invoker)
+            return reply
+        except CommunicationError as e:
+            self.logger.error("MGD not running; event not sent")
+            return {"result":"error", "message": str(e)}
+        except RPCError as e:
+            #self.logger.error("RPC error: %s", e)
+            return {"result":"error", "message": str(e)}
+
+    def interface_configuration(self, autoneg):
+        '''
+        Tell mgd to deactivate active edged (and standby edged if present)
+        '''
+        try:
+            self.logger.trace("Interface configuration")
+            reply = self.client.intfConfiguration(autoneg)
+            return reply
+        except CommunicationError as e:
+            self.logger.error("MGD not running; event not sent")
+            return {"result":"error", "message": str(e)}
+        except RPCError as e:
+            #self.logger.error("RPC error: %s", e)
+            return {"result":"error", "message": str(e)}
+
+    def startup(self, configOrder=None):
+        '''
+        Retrieve configuration from mgd
+        '''
+        try:
+            self.logger.trace("Getting startup configuration")
+            reply = self.client.startup(configOrder)
+            return reply
+        except CommunicationError as e:
+            self.logger.error("MGD not running; event not sent")
+            return {"result":"error", "message": str(e)}
+        except RPCError as e:
+            #self.logger.error("RPC error: %s", e)
+            return {"result":"error", "message": str(e)}
+
+    def get_configuration(self, modules=None):
+        '''
+        Retrieve configuration from mgd
+        '''
+        try:
+            self.logger.trace("Retrieving configuration")
+            reply = self.client.getConfiguration(modules)
+            return reply
+        except CommunicationError as e:
+            self.logger.error("MGD not running; event not sent")
+            return {"result":"error", "message": str(e)}
+        except RPCError as e:
+            #self.logger.error("RPC error: %s", e)
+            return {"result":"error", "message": str(e)}
+
+    def send_event(self, args):
+        '''
+        Send an event to the VCO
+        '''
+        eventTime = self.ms_since_epoch()
+        message = args.message
+        if message:
+            message = message.strip()
+        directerror = None
+        if not args.offline:
+            # try to connect directly to MGD first
+            try:
+                self.logger.info("Logging %s event %s: %s", args.category, args.eventName, message)
+                reply = self.client.postEvent(eventTime,
+                                              args.eventName,
+                                              args.category,
+                                              args.severity,
+                                              args.message,
+                                              args.detail,
+                                              args.linkName)
+                return reply
+            except CommunicationError as e:
+                self.logger.error("MGD not running; sending offline")
+                directerror = str(e)
+            except RPCError as e:
+                self.logger.error("RPC error: %s; sending offline", e)
+                directerror = str(e)
+
+        # That didn't work. Try to queue it up offline
+        try:
+            ev = pyutil.events.MGDEvent(eventTime,
+                                    args.eventName,
+                                    args.category,
+                                    args.severity,
+                                    args.message,
+                                    args.detail,
+                                    args.linkName)
+            _ = pyutil.events.EventPackage(self.logger, ev.todict(),
+                                       eventdir=pyutil.events.EVENT_CLIENT_TEMPDIR)
+            # and that's it. Just return
+            if directerror:
+                directerror = "Sent offline after direct send failed: %s" % directerror
+            result = {"result":"success", "message": directerror}
+            return result
+        except Exception as e:
+            self.logger.error("Unable to create offline event: %s", str(e))
+            errmsg = None
+            if directerror:
+                errmsg = "Direct send failed: %s; " % directerror
+            errmsg += "Offline send failed: %s" % str(e)
+            return {"result":"error", "message": errmsg}
+
+    '''
+    helper function for timestamping ms since the epoch
+    '''
+    def ms_since_epoch(self):
+        return int(time.time() * 1000)
+
+
+def handler(signum, frame):
+    print os.strerror(errno.ETIMEDOUT)
+    os._exit(1)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Mgd client',
+                                     epilog='To get client command help, invoke them with -h (e.g. "%s event -h")' % sys.argv[0])
+    parser.add_argument("-v", "--version", action="version",
+                        version="VeloCloud %s %s build %s" % (
+                            mgd.options.device,
+                            mgd.options.version.VC_VERSION_STRING,
+                            mgd.options.version.VC_GIT_TAG))
+    subparsers = parser.add_subparsers(dest="command", help="mgd client commands")
+    # Post event
+    event_parser = subparsers.add_parser('event', help='post an event')
+    event_parser.add_argument("eventName", metavar="EVENT_NAME", help="name of event to post")
+    categories = pyutil.utils.enumvalues(pyutil.events.Category)
+    event_parser.add_argument("-o", "--offline", help="generate event offline",
+                              action='store_true')
+    event_parser.add_argument("-c", "--category", help="category of event",
+                              choices=categories, default="SYSTEM")
+    severities = pyutil.utils.enumvalues(pyutil.events.Severity)
+    event_parser.add_argument("-s", "--severity", help="severity of event",
+                              choices=severities, default="INFO")
+    event_parser.add_argument("-m", "--message", help="event message")
+    event_parser.add_argument("-d", "--detail", help="detail of event")
+    event_parser.add_argument("--linkName", help="linkName for event")
+    # Get startup configuration
+    config_parser = subparsers.add_parser('startup', help='get startup policy configuration')
+    config_parser.add_argument("configOrder", nargs='?', help="configurations to sort to head")
+    # Print policy configuration
+    config_parser = subparsers.add_parser('config', help='print policy configuration')
+    config_parser.add_argument("cfg", nargs='*', help="configurations to fetch")
+    # Reset configuration (aka deactivation) command
+    resetconfig_parser = subparsers.add_parser('resetconfig', help='reset edge config, ie deactivate')
+    resetconfig_parser.add_argument("-r", "--remote-addr", help="remote address of invoker",
+                                    default="localhost")
+    _ = subparsers.add_parser('wanconfig', help='wan configuration has changed')
+    intf_parser = subparsers.add_parser('intfconfig', help='interface configuration (like autoneg) has changed')
+    intf_parser.add_argument("cfg", nargs='*', help="autoneg changed or not")
+
+    args = parser.parse_args()
+    return args
+
+def genevent(mgd_client, args):
+    reply = mgd_client.send_event(args)
+    if not reply:
+        return  # ??
+    if reply.get('result') != 'success':
+        msg = reply.get('message') or 'Unknown error'
+        print >>sys.stderr, "Error: %s" % msg
+        sys.exit(1)
+    
+def resetconfig(mgd_client, args):
+    mgd_client.reset_configuration(args.remote_addr)
+
+def intfconfig(mgd_client, args):
+    mgd_client.interface_configuration(args.cfg)
+
+def printstartup(mgd_client, args):
+    order = args.configOrder
+    orderStr = ','.join(order) if order else ''
+    ret = mgd_client.startup(orderStr)
+    print(json.dumps(ret, indent=1))
+    #if type(ret) is not list and ret.get('result') != 'success':
+    #    msg = ret.get('message') or 'Unknown error'
+    #    print >>sys.stderr, "Error: %s" % msg
+    #    sys.exit(1)
+    #print(json.dumps(ret, indent=1))
+
+def printconfig(mgd_client, args):
+    configs = args.cfg
+    ret = mgd_client.get_configuration(configs)
+    if type(ret) is not list and ret.get('result') != 'success':
+        msg = ret.get('message') or 'Unknown error'
+        print >>sys.stderr, "Error: %s" % msg
+        sys.exit(1)
+    for module in ret:
+        modname = module["module"]
+        cfgstr = json.dumps(module, indent=1)
+        print "%s = %s" % (modname, cfgstr)
+
+def process_args(mgd_client, args):
+    command = args.command
+    if command == "config":
+        printconfig(mgd_client, args)
+    elif command == "startup":
+        printstartup(mgd_client, args)
+    elif command == "event":
+        genevent(mgd_client, args)
+    elif command == "resetconfig":
+        resetconfig(mgd_client, args)
+    elif command == "intfconfig":
+        intfconfig(mgd_client, args)
+
+# Test function for running this script directly
+def main():
+    args = parse_args()
+    # Set up error handling in case MGD is not listening
+    signal.signal(signal.SIGALRM, handler)
+    signal.alarm(3)
+    # Attempt to send event to MGD.
+    mgd_client = MgdClient()
+    process_args(mgd_client, args)
+    #mgd_client.application_event("TEST_EVENT", "WARNING", "test message", "test detail detail")
+
+if __name__ == "__main__":
+    main()

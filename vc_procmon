@@ -1,0 +1,931 @@
+#!/usr/bin/python
+
+import sys
+import os.path
+sys.path.insert(0, '/opt/vc/lib/python')
+# Source tree:
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../pylibs'))
+
+import pyutil.logutils
+import pyutil.worker
+import pyutil.events
+import pyutil.utils
+
+import pydaemon
+import json
+import signal
+import threading
+import shlex
+import subprocess
+import time
+import copy
+import os
+
+monitored_process_dict = {}
+device_type = "edge"
+
+class ResourceMonitorThread(threading.Thread):
+    """
+    This class represents the worker thread that monitors the resource usage of active processes
+    """
+    def __init__(self, data, logger):
+        threading.Thread.__init__(self, name=data.get("name", "UNKNOWN"))
+        self.name = "ResourceMonitor"
+        self.logger = logger
+        self.meminfo = dict((i.split()[0].rstrip(':'),int(i.split()[1])) for i in open('/proc/meminfo').readlines())
+        self.total_memory_MB = int(self.meminfo['MemTotal'])/1000
+        self.logger.info("Launching %s Resource Monitor thread (%d MB available)", device_type, self.total_memory_MB)
+        self.monitor_interval_secs = 15*60
+        self.process_restart_holdoff_secs = 90
+        self.warning_event_frequency_secs = 60*60
+        if device_type == 'gateway':
+            self.warning_event_name = "GATEWAY_MEMORY_USAGE_WARNING"
+            self.error_event_name = "GATEWAY_MEMORY_USAGE_ERROR"
+        else:
+            self.warning_event_name = "EDGE_MEMORY_USAGE_WARNING"
+            self.error_event_name = "EDGE_MEMORY_USAGE_ERROR"
+        
+    def run(self):
+        while True:
+            #create a copy of the dict since we may modify it while iterating
+            temp = monitored_process_dict.copy()
+            if len(temp):
+                for name, process_info in temp.iteritems():
+                    try:
+                        current_MB = self.get_memory_MB(process_info["pid"])
+                        current_pct = float(current_MB/self.total_memory_MB*100)
+                        self.logger.info("Process %s (pid %d) current memory usage: %d MB (%.1f%%)", name, process_info["pid"], current_MB, current_pct)
+                        for index, threshold in enumerate(process_info["thresholds"]):
+                            #calculate the threshold based on the percentage and the total system memory for this device
+                            threshold_MB = float(threshold["threshold_pct"])/100*self.total_memory_MB;
+                         
+                            #if we're above threshold, try a malloc trim first to be safe
+                            if current_MB > threshold_MB: 
+                                    subprocess.call(["/opt/vc/bin/debug.py", "--malloc_trim"])
+                                    #update current_MB after the trim to see if it's reduced
+                                    current_MB = self.get_memory_MB(process_info["pid"])
+                            
+                            #if we're above threshold even after the trim, take action    
+                            if current_MB > threshold_MB:
+                                #store the dispcnt stats for analysis
+                                with open("/velocloud/state/memory_usage_details.txt", "w") as fd:
+                                    subprocess.call(["/opt/vc/bin/dispcnt", "-a", ">/velocloud/state/memory_usage_details.txt"], stdout=fd)
+                                            
+                                #if the action is event, we just log a warning event with the VCO
+                                #though the monitor runs every 15 minutes, we won't log this event more than once per hour
+                                if threshold["action"] == "event":
+                                    current_secs = time.time()
+                                    if (current_secs - process_info["last_event_secs"]) > self.warning_event_frequency_secs:
+                                        self.logger.warning("Process %s (pid %d) memory threshold of %d%% exceeded, generating event", 
+                                                            name, process_info["pid"], threshold["threshold_pct"])
+                                        message = ("Process " + name + " memory usage (" + str(current_MB) + "MB)  exceeds " +
+                                                            str(threshold["threshold_pct"]) + "% threshold")
+                                        self.generate_event(self.warning_event_name, pyutil.events.Severity.WARNING, message)
+                                        process_info["last_event_secs"] = current_secs
+                                elif threshold["action"] == "restart": 
+                                    #we want to ensure that this is not due to a temporary bloat (e.g. a loop or DOS that we will quickly
+                                    #recover from). This resource monitor is not time-sensitive, so we'll do this inline - sleep for 90 seconds,
+                                    #refetch the memory, and if it's still above threshold then kill it and restart.
+                                    self.logger.warning("Process %s (pid %d) memory threshold of %d%% exceeded, restart in %d seconds if not recovered",
+                                                        name, process_info["pid"], threshold["threshold_pct"], self.process_restart_holdoff_secs) 
+                                    delay(self.process_restart_holdoff_secs)
+                                    current_MB = self.get_memory_MB(process_info["pid"])
+                                    if current_MB > threshold_MB: 
+                                        self.logger.warning("Process %s (pid %d) memory threshold of %d%% exceeded for %d seconds, restarting service", 
+                                                            name, process_info["pid"], threshold["threshold_pct"], self.process_restart_holdoff_secs)
+                                        message = ("Process " + name + " memory usage (" + str(current_MB) + "MB)  exceeded " + 
+                                                            str(threshold["threshold_pct"]) + "% threshold for " +
+                                                            str(self.process_restart_holdoff_secs) + " seconds, restarting service")
+                                        self.generate_event(self.error_event_name, pyutil.events.Severity.ERROR, message)
+                                        #store the dispcnt stats for analysis
+                                        with open("/velocloud/state/memory_usage_details.txt", "w") as fd:
+                                            subprocess.call(["/opt/vc/bin/dispcnt", "-a", ">/velocloud/state/memory_usage_details.txt"], stdout=fd)
+                                        stat = subprocess.call(["killall", name])
+                                        if stat == 0:
+                                            # There was a process. Give it a second to exit, and then blast it.
+                                            self.logger.info("Killed existing process for %s", name)
+                                            delay(1)
+                                            subprocess.call(["killall", "-9", name])
+                                
+                    except Exception as e:
+                        self.logger.error("%s: unable to query memory usage: %s", self.name, str(e))
+            delay(self.monitor_interval_secs)
+
+    def get_memory_MB(self, pid):
+        total_mem_MB = 0
+        hugepages_total = 0
+        hugepages_free = 0
+        hugepages_used = 0
+        smaps_path = "/proc/" + str(pid) + "/smaps"
+        uss_lines = []
+        
+        #count all the memory that edged has allocated
+        if os.path.exists(smaps_path): 
+            lines = open(smaps_path).readlines() 
+            for line in lines:
+                if line.startswith("Private"):
+                    uss_lines.append(line)
+            total_mem_MB += sum([int(line.split()[1]) for line in uss_lines])/1000
+        
+        #count any hugepages, since edged/gwd is the user of these as well
+        with open("/proc/meminfo") as f:
+            for line in f:
+                name = line.split(':', 1)[0] 
+                if name == "HugePages_Total":
+                    hugepages_total = int(line.split(':', 1)[1])
+                if name == "HugePages_Free":
+                    hugepages_free = int(line.split(':', 1)[1])        
+            total_mem_MB += (hugepages_total-hugepages_free)*2.048
+        
+        return total_mem_MB
+    
+    def generate_event(self, event, severity, message):
+        eventTime = int(time.time() * 1000)
+        ev = pyutil.events.MGDEvent(eventTime, event,
+                                    severity = severity,
+                                    message = message,
+                                    detail = message)
+        _ = pyutil.events.EventPackage(self.logger, ev.todict(),
+                                       eventdir=pyutil.events.EVENT_CLIENT_TEMPDIR)
+                
+            
+class ProcessThread(threading.Thread):
+    """
+    This class represents the worker threads that monitor each process managed
+    by vc_procmon.
+    """
+    def __init__(self, data, logger, adopt=False):
+        threading.Thread.__init__(self, name=data.get("name", "UNKNOWN"))
+        self.name = data["name"]
+        self.logger = logger
+        self.adopt = adopt
+        # get fields from data
+        self.make_command(data)
+        # Pick up the rest of the process management properties
+        self.init_delay = data.get("init_delay", 0)
+        self.restart_delay = data.get("restart_delay", 0)
+        self.max_restarts_per_hour = data.get("max_restarts_per_hour")
+        self.post_exit_command = data.get("post_exit_command")
+        self.post_disable_command = data.get("post_disable_command")
+        self.post_startup_command = data.get("post_startup_command")
+        self.start_time_file = data.get("start_time_file")
+        self.log_failure_event = data.get("log_failure_event")
+        if type(self.post_disable_command) == str:
+            self.post_disable_command = shlex.split(self.post_disable_command)
+        self.niceness = data.get("niceness")
+        self.realtime_priority = data.get("realtime_priority")
+        self.memory_monitor_thresholds = data.get("memory_monitor_thresholds", {})
+        # Implicit parameters
+        stdout_log_name = "%s.stdout" % self.name
+        stderr_log_name = "%s.stderr" % self.name
+        self.stdout_logger = create_logger(stdout_log_name, stdout_log_name,
+                                           msgformat="%(asctime)s %(message)s",
+                                           max_bytes=1000000, num_versions=5,
+                                           delay=True)
+        self.stderr_logger = create_logger(stderr_log_name, stderr_log_name,
+                                           msgformat="%(asctime)s %(message)s",
+                                           max_bytes=1000000, num_versions=5,
+                                           delay=True)
+        # And the internal book-keeping data
+        self.event_category = data.get("name", "UNKNOWN")
+        if device_type == "gateway":
+            self.event_category = "GATEWAY"
+            self.diag_dumped_event_name = "GATEWAY_SERVICE_DUMPED"
+            default_failed_event_name = "GATEWAY_OTHER_SERVICE_FAILED"
+            default_disabled_event_name = "GATEWAY_OTHER_SERVICE_DISABLED"
+        else:
+            self.event_category = "EDGE"
+            self.diag_dumped_event_name = "EDGE_SERVICE_DUMPED"
+            default_failed_event_name = "EDGE_OTHER_SERVICE_FAILED"
+            default_disabled_event_name = "EDGE_OTHER_SERVICE_DISABLED"
+        self.failed_event_name = data.get("failed_event_name", default_failed_event_name)
+        self.disabled_event_name = data.get("disabled_event_name", default_disabled_event_name)
+        self.restart_queue = []
+        self.recent_restarts = 0
+        self.proc = None
+        self.pid = 0
+        self.event = threading.Event()
+        self.disable_file_path = "/tmp/%s.DISABLED" % self.name
+        self.mgd_disable_file_path = "/tmp/%s.MGD_DISABLED" % self.name
+        self.daemon = True
+        self.stopping = False
+        self.stopped = False
+        self.restarting = False
+        
+    def run(self):
+        # TODO: "adopt" support
+        start = time.time()
+        self.cleanup_existing_processes()
+        start_delay = self.init_delay - (time.time() - start) if self.init_delay else 0
+        error_restart = None
+        if self.start_time_file:
+            self.remove_start_time_file()
+        # Now launch the process
+        while not self.stopping:
+            try:
+                if start_delay > 0:
+                    delay(start_delay)
+                if self.stopping:
+                    break
+                self.wait_for_enable()
+                if self.stopping:
+                    break
+                self.launch_command(error_restart)
+                if self.start_time_file:
+                    self.record_start_time()
+            except Exception as e:
+                self.logger.critical("Unable to launch %s, disabling: %s", self.name, str(e))
+                self.stopping = True
+                self.emit_error_event(0, False, exc=e)
+                # kill the thread
+                return
+            
+            # execute any post startup commands
+            if self.post_startup_command:
+                psc_retcode=0
+                self.run_command(self.post_startup_command, "post-startup", psc_retcode)
+
+            # Wait for the process to exit
+            #retcode = self.proc.wait()
+            retcode = self.wait_for_completion()
+            self.logger.info("process %s (pid %d) completed", self.name, self.pid)
+            
+            if self.name in monitored_process_dict:
+                self.logger.info("Removing process %s (pid %d) from the Resource Monitor", self.name, self.pid)
+                del monitored_process_dict[self.name]
+                
+            self.proc = None
+            if self.start_time_file:
+                self.remove_start_time_file()
+
+            (normal, restartok) = self.ok_to_restart(retcode)
+            
+            if self.post_exit_command:
+                self.run_command(self.post_exit_command, "post-exit", retcode)
+            
+            if self.post_disable_command:
+                if not restartok:
+                    self.run_command(self.post_disable_command, "post-disable", retcode)
+                elif self.stopping and not self.restarting:
+                    # only run post-disable if not restarting immediately
+                    self.run_command(self.post_disable_command, "post-disable", retcode)
+
+            if not restartok or self.stopping:
+                if not restartok:
+                    # logger error already emitted
+                    self.emit_error_event(retcode, restartok)
+                else:
+                    # must be stopping
+                    self.logger.info("Process %s stopped during shutdown", self.name)
+                break
+            
+            # else, just log and loop back..
+            error_restart = None if normal else retcode
+            exitstat = self.exit_message(retcode)
+            msg = "Process %s (pid %d) %s: restarting" % (self.name, self.pid, exitstat)
+            if self.restart_delay:
+                start_delay = self.restart_delay
+                msg = msg + " after %.1f seconds" % self.restart_delay
+            else:
+                start_delay = 0
+                msg = msg + " now"
+            if normal:
+                self.logger.info(msg)
+            else:
+                self.logger.error(msg)
+            # Log an event immediately if NOT mgd
+            # For mgd, we log it after we relaunch mgd
+            if error_restart and self.name != "mgd" and self.log_failure_event:
+                self.emit_error_event(error_restart)
+
+
+        # Exited the loop
+        self.stopping = True
+
+    def make_command(self, data):
+        program = data["program"]
+        # The rest are all optional
+        args = data.get("args", [])
+        if type(args) == str:
+            args = shlex.split(self.args)
+        # Compose the command
+        self.command = [program]
+        if args:
+            self.command.extend(args)
+        # the base name of the actual program, limited to 15 chars.
+        # This is the "process name" used by linux, and known to killall.
+        self.processname = os.path.basename(program)[:15]
+
+    def prepare_child(self):
+        if self.niceness:
+            self.renice(int(self.niceness))
+        for sig in [signal.SIGINT,
+                    signal.SIGQUIT,
+                    signal.SIGPIPE]:
+            signal.signal(sig, signal.SIG_DFL)
+
+    def launch_command(self, error_restart=None):
+        self.logger.info("Launching process %s: %s",
+                         self.name, str.join(' ', self.command))
+        self.proc = subprocess.Popen(self.command,
+                                     stdin = None,
+                                     stdout = subprocess.PIPE,
+                                     stderr = subprocess.PIPE,
+                                     preexec_fn = self.prepare_child,
+                                     close_fds = True)
+        self.pid = self.proc.pid
+        self.stopped = False
+        self.logger.info("Process %s: pid = %d", self.name, self.pid)
+        
+        if self.realtime_priority:
+            rt_cmd = "chrt -ap -R -r " + str(self.realtime_priority) + " " + str(self.pid)
+            os.system(rt_cmd)
+            
+        #if the user has configured any thresholds to monitor, add it to the list of monitored processes
+        if self.memory_monitor_thresholds:
+            process_info = {"pid": self.pid, "thresholds": self.memory_monitor_thresholds, "last_event_secs": 0}
+            self.logger.info("Adding process %s (pid %d) to the Resource Monitor", self.name, self.pid)
+            monitored_process_dict[self.name] = process_info
+            
+        # If mgd restarting after failure, wait for it to launch before
+        # posting the failure event to it.
+        if error_restart and self.name == "mgd" and self.log_failure_event:
+            delay(5)  # to give mgd a chance to restart
+            self.emit_error_event(error_restart)
+
+    def record_start_time(self):
+        try:
+            with open(self.start_time_file, "w") as fd:
+                fd.write(str(int(time.time() * 1000)))  # ms
+        except:
+            pass # say something?
+
+    def remove_start_time_file(self):
+        try:
+            os.remove(self.start_time_file)
+        except:
+            pass
+
+    def read_process_output(self, infile, outlogger, pid):
+        while True:
+            line = infile.readline()
+            if not line:
+                break
+            outlogger.info("[%-5d] %s", pid, line.strip())
+
+    def start_output_reader(self, infile, outlogger, name):
+        th = threading.Thread(target=self.read_process_output,
+                              args=(infile, outlogger, self.pid),
+                              name=name)
+        th.daemon = True
+        th.start()
+        return th
+
+    def reap_output_reader(self, reader):
+        reader.join(5)
+        if reader.is_alive():
+            self.logger.warn("Process %s: pid %d: reader %s did not exit",
+                             self.name, self.pid, reader.name)
+
+    def wait_for_completion(self):
+        self.stdout_reader = self.start_output_reader(self.proc.stdout,
+                                                      self.stdout_logger,
+                                                      self.name + "_stdout")
+        self.stderr_reader = self.start_output_reader(self.proc.stderr,
+                                                      self.stderr_logger,
+                                                      self.name + "_stderr")
+        retcode = self.proc.wait()
+        self.logger.info("Process %s (%d, %d) returned from wait with retcode %d",
+                         self.name, self.pid, self.proc.pid, retcode)
+        # process has exited, and output files are closed
+        self.reap_output_reader(self.stdout_reader)
+        self.reap_output_reader(self.stderr_reader)
+        self.stdout_reader = None
+        self.stderr_reader = None
+	self.stopped = True
+        # Done
+        return retcode
+
+    def check_service_start_disabled(self):
+        if os.path.isfile(self.disable_file_path):
+            # cli-based disable
+            return self.disable_file_path
+        if os.path.isfile(self.mgd_disable_file_path):
+            # also check for MGD-requested temporary disablement (orthogonal)
+            return self.mgd_disable_file_path
+        # OK to start
+        return None
+
+    def wait_for_enable(self):
+        disable_logged = False
+        try:
+            while True:
+                if self.stopping:
+                    break
+                disabledby = self.check_service_start_disabled()
+                if not disabledby:
+                    self.logger.info("Service has been enabled: %s" % self.name)
+                    break
+                if not disable_logged:
+                    self.logger.warn("Service %s disabled; not launching as disable file %s exists" % (self.name, disabledby))
+                    disable_logged = True
+                # check every 2s on whether the process was enabled by deleting file
+                delay(2)
+        except:
+            self.logger.exception("Error while checking if service enabled: %s", self.name)
+
+    SIGMAP = dict((k, v) for v, k in signal.__dict__.iteritems() if v.startswith('SIG'))
+    DIAG_EXIT = -3
+    def exit_message(self, exitcode):
+        if exitcode > 0:
+            return "exited with error %d" % exitcode
+        elif exitcode == 0:
+            return "exited normally"
+        elif exitcode == -15:
+            return "terminated"
+        elif exitcode == -9:
+            return "killed"
+        elif exitcode == -2:
+            return "exited on interrupt"
+        elif exitcode == self.DIAG_EXIT:
+            return "killed for diagnostic memory dump"
+        else:
+            return "exited on signal %s" % self.SIGMAP[-exitcode]
+
+    def renice(self, niceness):
+        """
+        Callback for setting the niceness of a process during launch.
+        Unfortunately, all handles (including the logger) have been
+        closed by the time we call this, so we just swallow errors.
+        """
+        try:
+            os.nice(niceness)
+        except:
+            #no point logging: all handles have been closed already
+            #self.logger.exception("Error setting niceness %d", niceness)
+            pass
+
+    def emit_error_event_internal(self, eventname, severity, message, detail=None):
+        cmd = ["/opt/vc/bin/mgdclient", "event",
+               "-c", self.event_category,
+               "-s", severity,
+               "-m", message]
+        if detail:
+            cmd.extend(["-d", detail])
+        cmd.append(eventname)
+        try:
+            subprocess.call(cmd)
+            self.logger.info("%s: posted %s event %s",
+                             self.name, severity, eventname)
+        except Exception as e:
+            self.logger.error("%s: unable to post %s event %s: %s",
+                              self.name, severity, eventname, str(e))
+
+    def emit_error_event(self, retcode, restartok=True, exc=None):
+        if exc:
+            eventname = self.disabled_event_name
+            severity = "CRITICAL"
+            message = "Unable to launch service %s" % self.name
+            detail = str(exc)
+        elif not restartok:
+            eventname = self.disabled_event_name
+            severity = "CRITICAL"
+            message = "Service %s disabled after too many failures" % self.name
+            detail = "Last exit code = %d" % retcode
+        elif retcode == self.DIAG_EXIT:
+            eventname = self.diag_dumped_event_name
+            severity = "WARNING"
+            message = "Service %s killed for diagnostic memory dump" % self.name
+            detail = None
+        else:
+            eventname = self.failed_event_name
+            severity = "ERROR"
+            message = "Service %s failed with error %d, restarting" % (self.name, retcode)
+            detail = None
+        # post the event asynchronously, so as not to block on mgd
+        pyutil.worker.do_async(self.emit_error_event_internal,
+                               [eventname, severity, message, detail])
+
+    def run_command(self, command, reason, retcode):
+        if not command:
+            return
+        try:
+            self.logger.info("Invoking %s command %s",
+                             reason, ' '.join(command))
+            cmd_env = copy.deepcopy(os.environ)
+            cmd_env['PROCMON_RETCODE'] = str(retcode)
+            ret = subprocess.call(command, env=cmd_env)
+            self.logger.info("Finished %s command, status=%d",
+                             reason, ret)
+        except Exception as e:
+            self.logger.error("Exception calling command %s: %s",
+                              reason, ' '.join(command), str(e))
+
+    def is_normal_exit(self, retcode):
+        """
+        Check if a process exit is "normal": exit 0, or certain user-generated
+        signals like TERM, KILL, INT, etc., are treated as "normal". SIGXCPU (24)
+	is used by edged to indicate a controlled/dampened suicide on detecting a
+	deadlock
+        """
+        return retcode in [0, -1, -2, -9, -15, -24]
+
+    def ok_to_restart(self, retcode):
+        """
+        Checks to see if we have had too many restarts in the last hour,
+        if such a limit is configured.
+        
+        "Normal" and diagnostic exits do not count against such a limit.
+        """
+        normal = self.is_normal_exit(retcode)
+        if normal or retcode == self.DIAG_EXIT:
+            return (normal, True)
+        if not self.max_restarts_per_hour:
+            return (False, True)
+        restart_time = time.time()
+        if len(self.restart_queue) >= self.max_restarts_per_hour:
+            oldest_restart_time = self.restart_queue.pop(0)
+            if restart_time - oldest_restart_time < 60*60:
+                self.logger.critical("Process %s attempted more than %d restarts with %.1f seconds; disabling service",
+                                     self.name, self.max_restarts_per_hour,
+                                     restart_time - oldest_restart_time)
+                return (False, False)
+        # Else just queue up the latest restart and return
+        self.restart_queue.append(restart_time)
+        return (False, True)
+
+    def cleanup_existing_processes(self):
+        stat = subprocess.call(["killall", self.processname])
+        if stat == 0:
+            # There was a process. Give it a second to exit, and then blast it.
+            self.logger.info("Killed existing process for %s", self.name)
+            delay(1)
+            stat = subprocess.call(["killall", "-9", self.processname])
+            tries = 10
+            while stat == 0 and tries > 0:
+                self.logger.info("Existing process for %s did not die, retrying", self.name)
+                time.sleep(1)
+                tries = tries - 1
+                stat = subprocess.call(["killall", "-9", self.processname])
+            if stat == 0:
+                self.logger.fatal("Existing process for %s did not die, rebooting", self.name)
+                last_gasp_reboot(self.logger, [self.processname])
+
+    def soft_stop(self):
+        # kill any existing process
+        self.stopping = True
+        if self.proc:
+            if self.name in monitored_process_dict:
+                self.logger.info("Removing process %s (pid %d) from the Resource Monitor", self.name, self.pid)
+                del monitored_process_dict[self.name]
+            self.proc.terminate()
+
+    def hard_stop(self):
+        if self.proc:
+            try:
+                if self.name in monitored_process_dict:
+                    self.logger.info("Removing process %s (pid %d) from the Resource Monitor", self.name, self.pid)
+                    del monitored_process_dict[self.name]
+                self.proc.kill()
+            except:
+                pass
+
+
+SOFT_STOP_TIME_SECS=10
+HARD_STOP_TIME_SECS=20
+
+class ProcessMonitor(pydaemon.Daemon):
+    config_file = "/opt/vc/etc/vc_processes.json"
+    process_map = {}
+    process_sequence = []
+    stopping = False
+
+    def setup(self):
+        os.umask(022) # pydaemon's __daemonize will reset this to 0!
+        self.logger = create_logger("process_monitor", "vc_procmon.log",
+                                    max_bytes=100000, num_versions=5)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGUSR2, self.signal_handler)
+        # Ignore certain signals that can abort procmon restarts too soon
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+
+    def run(self):
+        os.umask(022) # pydaemon's __daemonize will have reset this to 0!
+        self.run_internal()
+
+    def cleanup(self, restarting=False):
+        self.cleanup_internal(restarting)
+
+    def run_internal(self, adopt=False):
+        self.logger.info("Starting VC Process Monitor")
+        proc_data = None
+        try:
+            with open(self.config_file) as f:
+                proc_data = json.load(f)
+        except Exception as e:
+            self.logger.fatal("Unable to load configuration file %s: %s",
+                              self.config_file, str(e))
+            sys.exit(1)
+
+        #launch the processes
+        for spec in proc_data:
+            procname = spec.get("name")
+            if not procname:
+                self.logger.error("Invalid process spec (missing name) in config file: %s",
+                                  str(spec))
+                continue
+            try:
+                th = ProcessThread(spec,
+                                   self.logger,
+                                   adopt=adopt)
+                th.start()
+                self.process_map[procname] = th
+                self.process_sequence.append(procname)
+            except Exception as e:
+                self.logger.error("Unable to start process %s: %s",
+                                  procname, str(e))
+
+        #launch the resource monitor thread
+        try:
+            th = ResourceMonitorThread(spec, self.logger)
+            th.start()
+        except Exception as e:
+                self.logger.error("Unable to start Resource Monitor: %s", str(e))
+
+        print "Waiting for signal"
+        signal.pause()
+
+    def wait_for_exit(self, processes, period=5):
+        #self.logger.debug("wait_for_exit: waiting for %s for %d seconds", processes, period)
+        still_living = [] # either process, or its postexit/disable script
+        starttime = time.time()
+        now = time.time()
+        while now < starttime + period:
+            delay(0.5)
+            still_living = []
+            for procname in processes:
+                try:
+                    th = self.process_map[procname]
+                    if th and th.is_alive():
+                        #self.logger.debug("wait_for_exit: %s is still running", procname)
+                        still_living.append(procname)
+                except:
+                    pass
+            if not still_living:
+                return still_living  # all exited
+            #self.logger.debug("wait_for_exit: not done yet, %s still running", still_living)
+            now = time.time()
+        # Something didn't stop
+        #self.logger.debug("wait_for_exit: some threads did not stop: %s", still_living)
+        return still_living
+
+    def cleanup_internal(self, restarting=False, abandon=False):
+        # TODO: handle abandon
+        # kill everything if stopping
+        #self.logger.info("Cleanup_internal: initial sequence")
+        rev_proc_seq = list(reversed(self.process_sequence))
+        if "mgd" in rev_proc_seq:
+            # move mgd to front
+            rev_proc_seq.remove("mgd")
+            rev_proc_seq.insert(0, "mgd")
+        for procname in rev_proc_seq:
+            try:
+                #self.logger.info("Checking on process %s", procname)
+                th = self.process_map[procname]
+                # Always send at least a soft stop, even if proc is not running now
+                self.logger.info("Stopping process %s (pid %d)", procname, th.pid)
+                th.stopping = True
+                th.restarting = restarting
+                th.soft_stop()
+            except Exception as e:
+                self.logger.exception("Exception stopping %s", e)
+            if procname == "mgd":
+                delay(1)   # for it to send its events to VCO before edged dies
+        # Now wait for upto 5 seconds
+        #self.logger.info("Cleanup_internal: waiting for finish")
+        still_living = self.wait_for_exit(rev_proc_seq, period=SOFT_STOP_TIME_SECS)
+
+        if still_living:
+            #Need to issue a kill, and wait a bit longer
+            #self.logger.info("Cleanup_internal: final sequence")
+            for procname in still_living:
+                try:
+                    #self.logger.info("Re-checking on process %s", procname)
+                    th = self.process_map[procname]
+                    if not th or not th.is_alive() or th.stopped:
+                        self.logger.info("Process %s not running", procname)
+                        continue
+                    self.logger.info("Killing process %s (pid %d)", procname, th.pid)
+                    th.hard_stop()
+                except Exception as e:
+                    self.logger.exception("Exception killing %s", e)
+            # Bug #14218: wait extra time for killed process to send SIGCHLD..
+            # HACK. Reduce once we understand what is happening on KVM/uCPE.
+            still_living = self.wait_for_exit(still_living, period=HARD_STOP_TIME_SECS)
+            #self.logger.info("Cleanup_internal: final sequence completed")
+
+        # check if something is still around..
+        if still_living:
+            self.logger.warning("Some processes did not fully exit or clean up: %s", still_living)
+            self.last_gasp_kill(still_living)
+        else:
+            self.logger.info("Finished subprocess cleanup")
+
+    # Bug 16668: # Make one final attempt to kill -9 the stubborn,
+    # non-exiting processes. Try a few more times directly on the PID.
+    # If that fails, reboot the system hard (with -n, to prevent getting
+    # caught up in the init scripts, which will loop back to procmon).
+    def last_gasp_kill(self, still_living):
+        self.logger.info("last_gasp_kill: killing processes %s", still_living)
+        attempts = 4
+        processes = []
+        while still_living and attempts > 0:
+            processes = []
+            time.sleep(2)
+            for procname in still_living:
+                th = self.process_map[procname]
+                pid = th.pid
+                try:
+                    # log copiously
+                    self.logger.info("last_gasp_kill: killing process %s (%d)",
+                                     procname, pid)
+                    os.kill(pid, 9)
+                    self.logger.info("last_gasp_kill: process %s (%d) did not die",
+                                     procname, pid)
+                    processes.append(procname)
+                except Exception as e:
+                    self.logger.info("last_gasp_kill: process %s (%d) is now dead",
+                                     procname, pid)
+            if not processes:
+                self.logger.info("last_gasp_kill: processes successfully cleaned up")
+                return
+            attempts = attempts-1
+            still_living = processes
+        self.logger.fatal("last_gasp_kill: could not clean up %s: rebooting", still_living)
+        last_gasp_reboot(self.logger, still_living)
+
+    def signal_handler(self, signum, _):
+        """
+        Intercepts SIGTERM to call cleanup() and to cleanly exit.
+        Handles the horrible behavior of stop() that repeatedly
+        bangs us with SIGTERM, not allowing any cleanup of longer
+        than 0.1 seconds.
+        """
+        if not signum in (signal.SIGTERM, signal.SIGUSR2):
+            self.logger.warn("Unknown signal %d received" % signum)
+            return
+        if self.stopping:
+            self.logger.info("In signal_handler, ignoring")
+            return
+        self.stopping = True
+        self.logger.info("In signal_handler, stopping")
+        restarting = signum == signal.SIGUSR2
+        if self.cleanup(restarting) is None:
+            os._exit(0)
+        
+    def _stop(self, restarting=False):
+        """
+        Override the stop method of Daemon.
+        """
+        # Tries to read the process id from the pid file
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except ValueError:
+            sys.stderr.write("failed to read pid file\n")
+            sys.exit(2)
+        except IOError:
+            sys.stderr.write("%s is not running.\n" % self.daemon_name)
+            sys.exit(1)
+
+        # Tries to kill the daemon process
+        #sys.stdout.write('stopping %s ...\n' % self.daemon_name)
+        done = True
+        killsig = signal.SIGUSR2 if restarting else signal.SIGTERM
+        try:
+            os.kill(pid, killsig)
+            start = time.time()
+            now = time.time()
+            # Bug #14218: wait longer for killed child process to be noticed
+            # HACK. Reduce once we understand what is happening on KVM/uCPE.
+            # Bug #16668: wait even longer for last_gasp_kill
+            wait_until = start + SOFT_STOP_TIME_SECS + HARD_STOP_TIME_SECS + 30
+            while now < wait_until:
+                os.kill(pid, 0)
+                delay(0.5)
+                now = time.time()
+            done = False # never finished
+        except OSError, err:
+            err = str(err)
+            # normal exit, the process has been killed, os.kill raises an OSError.
+            if err.find("No such process") > 0:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+                else:
+                    print str(err)
+                    sys.exit(3)
+        if not done:
+            print >>sys.stderr, "Process %d did not exit, killing" % pid
+            try:
+                os.kill(pid, signal.SIGKILL)
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            except:
+                pass
+
+    def _restart(self):
+        """
+        Restarts the daemon.
+        """
+        if self._status():
+            self._stop(restarting=True)
+        self._start()
+
+    def debug(self):
+        self.setup()
+        try:
+            self.run()
+        except KeyboardInterrupt as e:
+            print "Received keyboard interrupt, exiting"
+        except Exception as e:
+            self.logger.error("Unexpected error, exiting: %s", str(e))
+
+def delay(seconds):
+    try:
+        time.sleep(seconds)
+    except:
+        # log something?
+        pass
+
+def last_gasp_reboot(logger, processes):
+    detail = {
+        'processes': processes,
+    }
+    category = "GATEWAY" if device_type == "gateway" else "EDGE"
+    eventname = "MGD_EMERG_REBOOT"
+    severity = "CRITICAL"
+    cmd = ["/opt/vc/bin/mgdclient", "event",
+           "-o",
+           "-c", category,
+           "-s", severity,
+           "-m", "Rebooting system to recover from stuck process(es): %s" % processes,
+           "-d", str(detail),
+           eventname]
+    try:
+        subprocess.call(cmd)
+        logger.info("last_gasp_reboot: posted %s event %s",
+                    severity, eventname)
+    except Exception as e:
+        logger.error("last_gasp_reboot: unable to post %s event %s: %s",
+                     severity, eventname, str(e))
+
+    logger.info("last_gasp_reboot: rebooting in 5 seconds")
+    time.sleep(3)
+    try:
+        os.system("sync")
+    except Exception as e:
+        logger.exception("last_gasp_kill:sync", e)
+    time.sleep(3)
+    try:
+        os.system("reboot -f")
+    except Exception as e:
+        logger.exception("last_gasp_kill:reboot", e)
+
+def check_device_type():
+    global device_type
+    try:
+	with open("/etc/config/mgd") as cf:
+	    mgdconfig = pyutil.utils.cvt_utf8(json.load(cf))
+	device_type = mgdconfig.get('mgd',{}).get('device','edge')
+    except:
+	pass
+
+DEFAULT_LOG_DIR='/var/log'
+def create_logger(logger_name, file_name,
+                  max_bytes, num_versions,
+                  msgformat="%(asctime)s %(levelname)s [%(threadName)s %(process)d(%(osTid)d)] %(message)s",
+                  delay=False):
+    # file_name should be relative to DEFAULT_LOG_DIR
+    full_file_name = os.path.join(DEFAULT_LOG_DIR, file_name)
+    logger = pyutil.logutils.makeLogger(logger_name, full_file_name,
+                                        log_format=msgformat,
+                                        max_size=max_bytes,
+                                        backup_count=num_versions)
+    return logger
+
+def main():
+    # create the directories for storing state information
+    threading.enumerate()[0].name = 'main'
+    check_device_type()
+    os.system("mkdir -p /velocloud/state/bw_testing")
+    os.system("mkdir -p /velocloud/state/interfaces")
+    # Now invoke the PyDaemon 
+    daemon = ProcessMonitor("/var/run/vc_procmon.pid", "ProcessMonitor")
+    daemon.main(extended_args={"debug":daemon.debug})
+
+if __name__=="__main__":
+    main()
+    sys.exit(0)  
